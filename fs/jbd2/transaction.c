@@ -1616,6 +1616,7 @@ int jbd2_journal_forget (handle_t *handle, struct buffer_head *bh)
 			__jbd2_journal_file_buffer(jh, transaction, BJ_Forget);
 		} else {
 			__jbd2_journal_unfile_buffer(jh);
+			jbd2_journal_put_journal_head(jh);
 			if (!buffer_jbd(bh)) {
 				spin_unlock(&journal->j_list_lock);
 				goto not_jbd;
@@ -1989,11 +1990,10 @@ static void __jbd2_journal_temp_unlink_buffer(struct journal_head *jh)
 }
 
 /*
- * Remove buffer from all transactions.
+ * Remove buffer from all transactions. The caller is responsible for dropping
+ * the jh reference that belonged to the transaction.
  *
  * Called with bh_state lock and j_list_lock
- *
- * jh and bh may be already freed when this function returns.
  */
 static void __jbd2_journal_unfile_buffer(struct journal_head *jh)
 {
@@ -2002,7 +2002,6 @@ static void __jbd2_journal_unfile_buffer(struct journal_head *jh)
 
 	__jbd2_journal_temp_unlink_buffer(jh);
 	jh->b_transaction = NULL;
-	jbd2_journal_put_journal_head(jh);
 }
 
 void jbd2_journal_unfile_buffer(journal_t *journal, struct journal_head *jh)
@@ -2016,6 +2015,7 @@ void jbd2_journal_unfile_buffer(journal_t *journal, struct journal_head *jh)
 	__jbd2_journal_unfile_buffer(jh);
 	spin_unlock(&journal->j_list_lock);
 	jbd_unlock_bh_state(bh);
+	jbd2_journal_put_journal_head(jh);
 	__brelse(bh);
 }
 
@@ -2170,6 +2170,7 @@ static int __dispose_buffer(struct journal_head *jh, transaction_t *transaction)
 	} else {
 		JBUFFER_TRACE(jh, "on running transaction");
 		__jbd2_journal_unfile_buffer(jh);
+		jbd2_journal_put_journal_head(jh);
 	}
 	return may_free;
 }
@@ -2535,9 +2536,11 @@ void jbd2_journal_file_buffer(struct journal_head *jh,
  * Called under j_list_lock
  * Called under jbd_lock_bh_state(jh2bh(jh))
  *
- * jh and bh may be already free when this function returns
+ * When this function returns true, there's no next transaction to refile to
+ * and the caller has to drop jh reference through
+ * jbd2_journal_put_journal_head().
  */
-void __jbd2_journal_refile_buffer(struct journal_head *jh)
+bool __jbd2_journal_refile_buffer(struct journal_head *jh)
 {
 	int was_dirty, jlist;
 	struct buffer_head *bh = jh2bh(jh);
@@ -2549,7 +2552,7 @@ void __jbd2_journal_refile_buffer(struct journal_head *jh)
 	/* If the buffer is now unused, just drop it. */
 	if (jh->b_next_transaction == NULL) {
 		__jbd2_journal_unfile_buffer(jh);
-		return;
+		return true;
 	}
 
 	/*
@@ -2584,6 +2587,7 @@ void __jbd2_journal_refile_buffer(struct journal_head *jh)
 
 	if (was_dirty)
 		set_buffer_jbddirty(bh);
+	return false;
 }
 
 /*
@@ -2595,15 +2599,18 @@ void __jbd2_journal_refile_buffer(struct journal_head *jh)
 void jbd2_journal_refile_buffer(journal_t *journal, struct journal_head *jh)
 {
 	struct buffer_head *bh = jh2bh(jh);
+	bool drop;
 
 	/* Get reference so that buffer cannot be freed before we unlock it */
 	get_bh(bh);
 	jbd_lock_bh_state(bh);
 	spin_lock(&journal->j_list_lock);
-	__jbd2_journal_refile_buffer(jh);
+	drop = __jbd2_journal_refile_buffer(jh);
 	jbd_unlock_bh_state(bh);
 	spin_unlock(&journal->j_list_lock);
 	__brelse(bh);
+	if (drop)
+		jbd2_journal_put_journal_head(jh);
 }
 
 /*
