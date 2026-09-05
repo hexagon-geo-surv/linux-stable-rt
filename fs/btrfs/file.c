@@ -151,16 +151,8 @@ int btrfs_dirty_pages(struct btrfs_inode *inode, struct page **pages,
 
 	end_of_last_block = start_pos + num_bytes - 1;
 
-	/*
-	 * The pages may have already been dirty, clear out old accounting so
-	 * we can set things up properly
-	 */
-	clear_extent_bit(&inode->io_tree, start_pos, end_of_last_block,
-			 EXTENT_DELALLOC | EXTENT_DO_ACCOUNTING | EXTENT_DEFRAG,
-			 cached);
-
-	err = btrfs_set_extent_delalloc(inode, start_pos, end_of_last_block,
-					extra_bits, cached);
+	err = btrfs_reset_extent_delalloc(inode, start_pos, end_of_last_block,
+					  extra_bits, cached);
 	if (err)
 		return err;
 
@@ -1511,6 +1503,22 @@ relock:
 	}
 
 	if (check_direct_IO(fs_info, from, pos)) {
+		btrfs_inode_unlock(BTRFS_I(inode), ilock_flags);
+		goto buffered;
+	}
+	/*
+	 * We can't control the folios being passed in, applications can write
+	 * to them while a direct IO write is in progress.  This means the
+	 * content might change after we calculated the data checksum.
+	 * Therefore we can end up storing a checksum that doesn't match the
+	 * persisted data.
+	 *
+	 * To be extra safe and avoid false data checksum mismatch, if the
+	 * inode requires data checksum, just fallback to buffered IO.
+	 * For buffered IO we have full control of page cache and can ensure
+	 * no one is modifying the content during writeback.
+	 */
+	if (!(BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM)) {
 		btrfs_inode_unlock(BTRFS_I(inode), ilock_flags);
 		goto buffered;
 	}
